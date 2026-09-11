@@ -1,0 +1,365 @@
+local function getHitboxExclude(char)
+	local excluded = {
+		char,
+		workspace.VFX,
+		workspace.Debris,
+	}
+	for _, plr in game:GetService("Players"):GetPlayers() do
+		local plrChar = plr.Character
+		if not plrChar then continue end
+		for _, child in plrChar:GetChildren() do
+			if child.Name:match("Model$") then
+				table.insert(excluded, child)
+			end
+		end
+	end
+	for _, npc in workspace.NPCs:GetChildren() do
+		for _, child in npc:GetChildren() do
+			if child.Name:match("Model$") then
+				table.insert(excluded, child)
+			end
+		end
+	end
+	return excluded
+end
+
+local function scheduleCleanup(char, window)
+	-- Check again 1 second
+	local delayTime = math.max(0.1, (window.Expires - os.clock()) + 1)
+
+	task.delay(delayTime, function()
+		if hitWindows[char] == window then
+			if os.clock() > window.Expires then
+				hitWindows[char] = nil
+				CombatService.ClearClashEntry(char)
+			else
+				scheduleCleanup(char, window)
+			end
+		end
+	end)
+end
+
+function CombatService.OpenHitWindow(char, hitboxType, activeDuration, openDelay)
+	local rootPart = char:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return
+	end
+	local weaponName = StateManager.GetState(char, "CurrentWeapon") or "Fists"
+	local weaponFolder = ReplicatedStorage.Weapons:FindFirstChild(weaponName)
+	local hitboxTemplate = weaponFolder and weaponFolder.Hitboxes:FindFirstChild(hitboxType)
+	if not hitboxTemplate then
+		warn("Hitbox template missing:", weaponName, hitboxType)
+		return
+	end
+
+	CombatService.RegisterHitboxActive(char)
+
+	openDelay = openDelay or 0
+	local now = os.clock()
+
+	local lifetime = activeDuration + CLAIM_GRACE
+	local floor = LIFETIME_FLOOR[hitboxType]
+	if floor then
+		lifetime = math.max(lifetime, floor)
+	end
+
+	local recoveryEndsAt = nil
+	if hitboxType == "M1Hitbox" or hitboxType == "AirM1Hitbox" then
+		local count = StateManager.GetState(char, "m1Count") or 1
+		local commit = CombatTiming.GetTotalCommit(weaponName, count)
+		if commit then
+			recoveryEndsAt = now + commit
+		end
+	end
+
+	local window = {
+		Type = hitboxType,
+		Offset = CFrame.new(0, 0, -(hitboxTemplate.Size.Z * 0.5 + 0.5)),
+		Size = hitboxTemplate.Size,
+		Opens = now + openDelay,
+		RecoveryEndsAt = recoveryEndsAt,
+		Expires = now + openDelay + lifetime,
+		Hit = {},
+	}
+	hitWindows[char] = window
+
+	scheduleCleanup(char, window)
+end
+
+function CombatService.HitboxCreate(char, duration, hitboxType, allowChain)
+	if not char then print("no char") return end
+	if feintActive[char] then return end
+	if hitboxCooldowns[char] and not allowChain then
+		print("hitbox cooldown blocked") return
+	end
+	if activeHitboxes[char] and not allowChain then
+		if activeHitboxes[char]._cancel then
+			activeHitboxes[char]._cancel()
+		end
+		activeHitboxes[char]:WrappedClean()
+	end
+
+	hitboxCooldowns[char] = true
+	task.delay(0.03, function() hitboxCooldowns[char] = nil end)
+
+	local rootPart = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChild("Humanoid")
+	if not rootPart or not hum or hum.Health <= 0 then
+		print("no rootpart or hum") return
+	end
+	if StateManager.GetState(char, "IsStunned") or StateManager.GetState(char, "IsSoftStunned") then
+		print("stunned") return
+	end
+
+	if StateManager.GetState(char, "IsBlocking") then
+		return
+	end
+
+	local weaponName = StateManager.GetState(char, "CurrentWeapon") or "Fists"
+	local weaponFolder = ReplicatedStorage.Weapons:FindFirstChild(weaponName)
+	local hitboxTemplate = weaponFolder
+		and weaponFolder.Hitboxes:FindFirstChild(hitboxType)
+
+	if not hitboxTemplate then
+		warn("Hitbox template missing:", weaponName, hitboxType)
+		return
+	end
+
+	CombatService.RegisterHitboxActive(char)
+
+	local attackerPlayer = Players:GetPlayerFromCharacter(char)
+	if attackerPlayer and WINDOW_TYPES[hitboxType] then
+		local existing = hitWindows[char]
+		if existing and existing.Type == hitboxType then
+			existing.Expires = math.max(existing.Expires, os.clock() + math.clamp(duration, 0.03, 0.35) + CLAIM_GRACE)
+			if MULTI_HIT_TYPES[hitboxType] then
+				existing.Hit = {}
+				CombatService.RegisterHitboxActive(char)
+			end
+		else
+			CombatService.OpenHitWindow(char, hitboxType, duration)
+		end
+		return
+	end
+	
+	local size = hitboxTemplate.Size
+	local forwardOffset = -(size.Z / 2 + 0.5)
+
+	local look = rootPart.CFrame.LookVector
+	local flatLook = Vector3.new(look.X, 0, look.Z)
+	flatLook = flatLook.Magnitude > 1e-4
+		and flatLook.Unit
+		or rootPart.CFrame.RightVector * -1
+	local levelCFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + flatLook)
+
+	local hitbox = HitboxHandler.new({
+		OriginPart = rootPart,
+		OriginOffset = CFrame.new(0, 0, forwardOffset),
+		Origin = levelCFrame * CFrame.new(0, 0, forwardOffset),
+		Template = hitboxTemplate,
+		Exclude = getHitboxExclude(char),
+		Duration = math.clamp(duration, 0.05, 1),
+		SubSteps = 5,
+		Debug = Configuration.HitboxVisualize == true,
+		Attacker = char,
+	})
+
+	activeHitboxes[char] = hitbox
+	hitbox.FinishedSignal:Connect(function()
+		if activeHitboxes[char] == hitbox then
+			activeHitboxes[char] = nil
+		end
+		CombatService.ClearClashEntry(char)
+	end)
+
+	hitbox.HitSignal:Connect(function(hitCharacters)
+		if Players:GetPlayerFromCharacter(char) then
+			return
+		end
+
+		for _, enemyChar in ipairs(hitCharacters) do
+			if StateManager.GetState(char, "IsStunned")
+				or StateManager.GetState(char, "IsSoftStunned")
+				or StateManager.GetState(char, "IsBlocking") then
+				CombatService.HitboxDelete(char)
+				break
+			end
+
+			local enemyType = hitWindows[enemyChar] and hitWindows[enemyChar].Type
+			if not CombatService.HasTypePriority(hitboxType, enemyType)
+				and CombatService.CheckClash(char, enemyChar) then
+				CombatService.ResolveClash(char, enemyChar)
+				continue
+			end
+
+
+			if CombatService.BothSwinging(char, enemyChar) then
+				CombatService.ResolveFirstHit(char, enemyChar, hitboxType, enemyType)
+				continue
+			end
+
+			local enemyIframe = StateManager.GetState(enemyChar, "Iframe")
+			if not enemyIframe then
+				if HitLogic.CheckCounter(char, enemyChar) then continue end
+				if hitboxType == "M1Hitbox" then
+					getWeapon(char).M1HitLogic(char, enemyChar)
+				elseif hitboxType == "AirM1Hitbox" then
+					CombatService.AirM1(char, enemyChar)
+				elseif hitboxType == "CritHitbox" then
+					getWeapon(char).CritHitLogic(char, enemyChar)
+				elseif hitboxType == "UptiltHitbox" then
+					CombatService.UptiltLogic(char, enemyChar)
+				elseif hitboxType == "DownslamHitbox" then
+					CombatService.DownslamLogic(char, enemyChar)
+				end
+			end
+		end
+	end)
+
+	hitbox.MissedSignal:Connect(function() end)
+	hitbox:Start()
+end
+
+
+
+local HITREG_WINDOW = 1
+local HITREG_MAX_PER_WINDOW = 30
+local hitRegBudget = {}
+
+Players.PlayerRemoving:Connect(function(player)
+	hitRegBudget[player] = nil
+end)
+
+local function hitRegisterAllowed(player)
+	local now = os.clock()
+	local bucket = hitRegBudget[player]
+	if not bucket or now - bucket.start > HITREG_WINDOW then
+		hitRegBudget[player] = { start = now, count = 1 }
+		return true
+	end
+	bucket.count += 1
+	if bucket.count > HITREG_MAX_PER_WINDOW then
+		if bucket.count == HITREG_MAX_PER_WINDOW + 1 then
+			warn(("[HitRegister] rate limit tripped by %s (%d in %.1fs)")
+				:format(player.Name, bucket.count, HITREG_WINDOW))
+		end
+		return false
+	end
+	return true
+end
+
+HitRegister.OnServerEvent:Connect(function(player, victim, attackerPos, victimPos)
+	if not RateLimiter.Check(player, "HitRegister") then return end
+	if not hitRegisterAllowed(player) then return end
+	local char = player.Character
+	if not char then return end
+
+	-- Argument types are checked before anything reads them: these come straight
+	-- off the wire and a non-Vector3 would otherwise reach the claim math.
+	if attackerPos ~= nil and typeof(attackerPos) ~= "Vector3" then return end
+	if victimPos ~= nil and typeof(victimPos) ~= "Vector3" then return end
+	local DBG = ServerConfig.DebugM1Reject
+	local function drop(reason)
+		if DBG then
+			warn(("[HIT DROP] %s -> %s | %s"):format(
+				char.Name, typeof(victim) == "Instance" and victim.Name or "?", reason))
+		end
+	end
+
+	local window = hitWindows[char]
+	if not window then drop("no hit window open") return end
+	local ping = player:GetNetworkPing()
+
+	local pingGrace = math.clamp(ping, 0, ServerConfig.HitboxClaimPingGrace or 0.08)
+
+	local isCrit = window.Type == "CritHitbox"
+
+	if not isCrit then
+		if os.clock() > (window.Expires + pingGrace) then drop("window expired") return end
+
+		local earlyGrace = (ServerConfig.HitboxClaimEarlyGrace or 0.1) + pingGrace
+		if window.Opens and os.clock() < (window.Opens - earlyGrace) then
+			drop("window not open yet")
+			return
+		end
+	end
+
+	if typeof(victim) ~= "Instance" or not victim:IsA("Model") or victim == char then return end
+	if not victim:FindFirstChildOfClass("Humanoid") then return end
+	if window.Hit[victim] then drop("already hit this victim this swing") return end
+	if feintActive[char] then drop("feint active") return end
+	if StateManager.GetState(char, "IsStunned")
+		or StateManager.GetState(char, "IsSoftStunned") then
+		drop("attacker stunned")
+		return
+	end
+	if StateManager.GetState(char, "IsBlocking") then
+		drop("attacker blocking")
+		return
+	end
+
+	local claim = nil
+	if typeof(attackerPos) == "Vector3" and typeof(victimPos) == "Vector3" then
+		claim = { AttackerPos = attackerPos, VictimPos = victimPos }
+	end
+
+
+	if window.RecoveryEndsAt and os.clock() > window.RecoveryEndsAt then
+		drop("swing already recovered")
+		return
+	end
+
+	if not HitValidator.Validate(char, victim, window.Offset, window.Size, claim) then
+		drop("HitValidator rejected (position/range)")
+		return
+	end
+
+	local victimType = hitWindows[victim] and hitWindows[victim].Type
+	if not CombatService.HasTypePriority(window.Type, victimType)
+		and CombatService.CheckClash(char, victim) then
+		window.Hit[victim] = true
+		CombatService.ResolveClash(char, victim)
+		return
+	end
+
+	if CombatService.BothSwinging(char, victim) then
+		window.Hit[victim] = true
+		CombatService.ResolveFirstHit(char, victim, window.Type, victimType)
+		return
+	end
+
+	window.Hit[victim] = true
+
+	if StateManager.GetState(victim, "Iframe") then drop("victim has Iframe") return end
+
+	if HitLogic.CheckCounter(char, victim) then return end
+
+	if window.Type == "M1Hitbox" then
+		getWeapon(char).M1HitLogic(char, victim)
+	elseif window.Type == "AirM1Hitbox" then
+		CombatService.AirM1(char, victim)
+	elseif window.Type == "CritHitbox" then
+		getWeapon(char).CritHitLogic(char, victim)
+	elseif window.Type == "UptiltHitbox" then
+		CombatService.UptiltLogic(char, victim)
+	elseif window.Type == "DownslamHitbox" then
+		CombatService.DownslamLogic(char, victim)
+	end
+end)
+
+function CombatService.HitboxDelete(char)
+	if hitWindows[char] then
+		hitWindows[char] = nil
+		CombatService.ClearClashEntry(char)
+	end
+	if activeHitboxes[char] then
+		local toClean = activeHitboxes[char]
+		activeHitboxes[char] = nil
+		if toClean._cancel then
+			toClean._cancel()
+		end
+		task.defer(function()
+			toClean:WrappedClean()
+		end)
+	end
+end
