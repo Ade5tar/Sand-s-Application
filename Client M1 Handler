@@ -1,0 +1,795 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
+local RunService = game:GetService("RunService")
+
+local Trove = require(ReplicatedStorage.Util.Trove)
+local WeaponData = require(ReplicatedStorage.Modules.ClientWeaponData)
+local SoundHandler = require(ReplicatedStorage.Modules.CharacterHandler.Components.SoundHandler)
+local UIManager = require(ReplicatedStorage.Modules.UIManager)
+local VFXHandler = require(ReplicatedStorage.Util.VFX)
+local SafeDestroy = require(ReplicatedStorage.Util.SafeDestroy)
+local Sequencer = require(ReplicatedStorage.Util.Sequencer)
+local Configuration = require(ReplicatedStorage.Modules.Configuration)
+local HitDetect = require(ReplicatedStorage.Modules.HitDetect)
+local CombatTiming = require(ReplicatedStorage.Modules.CombatTiming)
+local SkillDash = require(ReplicatedStorage.Util.SkillDash)
+
+-- Seconds into the M1 windup to hold at when the swing was started mid-dash.
+-- Was undeclared, so HoldForDash silently fell back to its 0.15 default.
+local M1_DASH_FREEZE = 0.1
+local SprintResume = require(ReplicatedStorage.Modules.CharacterHandler.Components.ActionHandler.SprintResume)
+
+local CombatEvent = ReplicatedStorage.Events.CombatEvent
+local CombatFunction = ReplicatedStorage.Events.CombatFunction
+local CamShakeEvent = ReplicatedStorage.Events.CamShakeEvent
+
+local FINISHER_SOUND = {
+	Thundercaller = "GroundSlam",
+	Axe = "GroundSlam",
+}
+
+local lastM1Track = nil
+
+
+local M1Handler = {}
+local M1Object = {}
+local localUptiltDebounce = false
+local localAirM1Debounce = false
+local localDownslamDebounce = false
+local M1Buffer = false
+
+
+local INPUT_QUEUE_WINDOW = 0.45
+
+
+local function canSlideNow(char)
+	if not char or not char.Parent then return false end
+	if char:GetAttribute("Sliding") then return false end
+	for _, state in { "IsStunned", "IsSoftStunned", "GuardBroken", "IsAttacking",
+		"IsUptilt", "DoingMove", "IsAwakening", "Grabbed",
+		"IsWallRunning", "IsWallStepping" } do
+		if char:GetAttribute(state) then return false end
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum then return false end
+	-- Grounded only: sliding needs a floor.
+	local state = hum:GetState()
+	return state ~= Enum.HumanoidStateType.Jumping
+		and state ~= Enum.HumanoidStateType.Freefall
+		and state ~= Enum.HumanoidStateType.Climbing
+end
+local CancelAirDetect = nil
+local CancelUptiltDetect = nil
+local CancelDownslamDetect = nil
+
+local AIR_M1_GROUND_CLEARANCE = 0.25
+local HRP_TO_FLOOR = 3 
+
+local function isAirborne(char, hrp, clearance)
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances =
+		{char, workspace.HITBOXES, workspace.Debris, workspace.VFX}
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local hit = workspace:Raycast(
+		hrp.Position,
+		Vector3.new(0, -(HRP_TO_FLOOR + (clearance or AIR_M1_GROUND_CLEARANCE)), 0),
+		params)
+	return hit == nil
+end
+
+local AIR_M1_MAX_HORIZONTAL_SPEED = 95
+local AIR_M1_MAX_VERTICAL_SPEED = 95
+local AIR_M1_PUSH = 50          
+local AIR_M1_PUSH_MAX = 70      
+local AIR_M1_FREEZE_LEAD = 0.06  
+local AIR_M1_FREEZE_MAX = 0.75   
+local AIR_M1_RELEASE_HEIGHT = 0.5  
+local AIR_M1_ANIM_SPEED = 1.2     
+local AIR_M1_ACTION_LOCK = 0.5
+
+
+local UPTILT_PUSH_DELAY = 0.12
+local UPTILT_PUSH_STRENGTH = 50
+local UPTILT_PUSH_TIME = 0.18
+
+local function getWeaponEffect(weaponName)
+	local weapon = ReplicatedStorage.Weapons:FindFirstChild(weaponName)
+	local scripts = weapon and weapon:FindFirstChild("Scripts")
+	local mod = scripts and scripts:FindFirstChild(weaponName)
+	local effects = mod and mod:FindFirstChild("Effects")
+	local effectMod = effects and effects:FindFirstChild(weaponName .. "Effect")
+	return effectMod and require(effectMod) or nil
+end
+
+function M1Handler.new(controller)
+	local self = setmetatable({}, {__index = M1Object})
+	self.__Trove = Trove.new()
+	self.Controller = controller
+	self.localM1Count = 1
+	self.lastM1Time = 0
+	self.nextM1AllowedTime = 0
+	self.Buffered = false
+	self.ChainOpen = false
+	self.CurrentTrack = nil
+	self.CurrentSeq = nil
+
+	-- Reset combo on stun
+	self.__Trove:Connect(
+		controller.Character:GetAttributeChangedSignal("IsStunned"),
+		function()
+			if controller.Character:GetAttribute("IsStunned") then
+				self:ResetCombo()
+			end
+		end
+	)
+	
+
+	self.__Trove:Connect(
+		controller.Character:GetAttributeChangedSignal("IsSoftStunned"),
+		function()
+			if controller.Character:GetAttribute("IsSoftStunned") then
+				self:ResetCombo()
+			end
+		end
+	)
+
+	self.__Trove:Connect(
+		controller.Character:GetAttributeChangedSignal("Parried"),
+		function()
+			if controller.Character:GetAttribute("Parried") then
+				self:ResetCombo()
+			end
+		end
+	)
+	
+
+	
+	local previewMobileButtonsOnPc = false
+	if UIS.TouchEnabled or previewMobileButtonsOnPc then
+		task.spawn(function()
+			local plr = Players.LocalPlayer
+			local playerGui = plr:WaitForChild("PlayerGui")
+			local combatUI = playerGui:WaitForChild("CombatUI", 10)
+			if not combatUI then
+				warn("M1Handler: CombatUI not found")
+				return
+			end
+
+			local uptiltButton
+			local startTime = os.clock()
+			repeat
+				uptiltButton = combatUI:FindFirstChild("Uptilt", true)
+				if uptiltButton then break end
+				task.wait(0.1)
+			until os.clock() - startTime >= 10
+
+			if not uptiltButton then
+				warn("M1Handler: Uptilt button not found")
+				return
+			end
+
+			self.__Trove:Connect(uptiltButton.Activated, function()
+				if plr:GetAttribute("EditingMobileButtons") then return end
+				local char = controller.Character
+				if char:GetAttribute("IsStunned")
+					or char:GetAttribute("IsSoftStunned")
+					or char:GetAttribute("IsBlocking")
+					or char:GetAttribute("Iframe")
+					or char:GetAttribute("DashIframe")
+					or char:GetAttribute("IsUptilt") then
+					return
+				end
+				if char:GetAttribute("WeaponEquipped") then
+					-- Air M1 briefly locks out uptilt (AIR_M1_ACTION_LOCK).
+					local lockUntil = char:GetAttribute("AirM1LockUntil")
+					if lockUntil and os.clock() < lockUntil then return end
+					self:DoUptilt()
+				end
+				
+			end)
+		end)
+	end
+
+	return self
+end
+
+function M1Object.TryM1(self)
+	local controller = self.Controller
+	local char = controller.Character
+	local hum = controller.Humanoid
+
+	if UIManager.AnyOpen() then return end
+
+	if char:GetAttribute("Sliding") then
+		local action = controller.Actions
+		local slideAction = action and action.ActionMap
+			and action.ActionMap.Combat
+			and action.ActionMap.Combat["Slide"]
+		if action and slideAction and slideAction.Module and slideAction.Module.End then
+			slideAction.Module.End(controller)
+		end
+		-- Fall through: the swing runs this frame, not next. The gates below still
+		-- apply, so a slide ending into a stun still rejects.
+	end
+
+	if char:GetAttribute("IsStunned")
+		or char:GetAttribute("IsAttacking")
+		or char:GetAttribute("IsSoftStunned")
+		or char:GetAttribute("IsBlocking")
+		or char:GetAttribute("Iframe") then
+		return
+	end
+
+	if char:GetAttribute("CanDownslam") and char:GetAttribute("IsUptilt") and char:GetAttribute("WeaponEquipped") and not char:GetAttribute("IsAttacking") then
+		self:DoDownslam()
+	elseif not UIS.TouchEnabled and UIS:IsKeyDown(Enum.KeyCode.LeftControl) and char:GetAttribute("WeaponEquipped") and not char:GetAttribute("IsAttacking") then
+		local uptiltLock = char:GetAttribute("AirM1LockUntil")
+		if uptiltLock and os.clock() < uptiltLock then return end
+		self:DoUptilt()
+	elseif isAirborne(char, controller.Root)
+		and not char:GetAttribute("IsUptilt")
+		and not char:GetAttribute("CanDownslam") and char:GetAttribute("WeaponEquipped") and not char:GetAttribute("IsAttacking")then
+		local hrp = controller.Root
+		local vel = hrp.AssemblyLinearVelocity
+		local horizSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+		local vertSpeed = math.abs(vel.Y)
+		
+		if horizSpeed <= AIR_M1_MAX_HORIZONTAL_SPEED and vertSpeed <= AIR_M1_MAX_VERTICAL_SPEED then
+			self:DoAirM1()
+		end
+	else
+		if not char:GetAttribute("WeaponEquipped") or isAirborne(char, controller.Root) then return end
+		self:M1Attack()
+	end
+end
+
+function M1Object.M1Attack(self)
+	local controller = self.Controller
+	local char = controller.Character
+	local now = os.clock()
+
+	-- If animation is playing and chain isn't open, reject entirely
+	if self.CurrentTrack and self.CurrentTrack.IsPlaying and not self.ChainOpen then
+		return
+	end
+
+	if now < (self.nextM1AllowedTime or 0) then
+		return -- reject, no retry scheduling
+	end
+
+	local stats = WeaponData.GetWeaponStats(char)
+	local timing = CombatTiming.GetWeapon(char:GetAttribute("CurrentWeapon") or "Fists")
+	local chainWindow = (timing and timing.comboWindow) or Configuration.M1ChainWindow
+	if now - self.lastM1Time > chainWindow then
+		self.localM1Count = 1
+	else
+		self.localM1Count = (self.localM1Count % stats.maxM1) + 1
+	end
+
+	self.lastM1Time = now
+	self:DoM1()
+end
+
+-- Input queue window for sliding. 
+function M1Object.QueueSlide(self)
+	self._QueuedSlideAt = os.clock()
+end
+
+function M1Object.ProcessQueuedInput(self)
+	local controller = self.Controller
+	local char = controller and controller.Character
+	if not char or not char.Parent then
+		self._QueuedSlideAt = nil
+		return
+	end
+
+	if not self._QueuedSlideAt then return end
+
+	local now = os.clock()
+	if now - self._QueuedSlideAt > INPUT_QUEUE_WINDOW then
+		self._QueuedSlideAt = nil
+		return
+	end
+
+	if canSlideNow(char) then
+		self._QueuedSlideAt = nil
+		local action = controller.Actions
+		local slideAction = action and action.ActionMap
+			and action.ActionMap.Combat
+			and action.ActionMap.Combat["Slide"]
+		if action and slideAction then
+			action:RunSkill(slideAction)
+		end
+	end
+end
+
+--[[
+function M1Object.FireBuffered(self)
+	if self.Buffered then
+		self.Buffered = false
+		task.defer(function()
+			self:M1Attack()
+		end)
+	end
+end
+]]
+
+
+function M1Object.ResetCombo(self)
+	self.localM1Count = 1
+	self.lastM1Time = 0
+	self.nextM1AllowedTime = 0
+	self.Buffered = false
+	self.ChainOpen = false
+	if self.CurrentSeq then
+		self.CurrentSeq:Cancel()
+		self.CurrentSeq = nil
+	end
+end
+
+function M1Object.DoM1(self)
+	
+	local controller = self.Controller
+	local char = controller.Character
+	local curWeapon = char:GetAttribute("CurrentWeapon")
+
+	if char:GetAttribute("DashIframe") then
+		char:SetAttribute("NoDashCancel", true)
+
+		local token = (char:GetAttribute("NoDashCancelToken") or 0) + 1
+		char:SetAttribute("NoDashCancelToken", token)
+
+		local commit = CombatTiming.GetTotalCommit(curWeapon, self.localM1Count)
+			or Configuration.M1ChainCooldown or 0.6
+		task.delay(commit, function()
+			if not char.Parent then return end
+			if char:GetAttribute("NoDashCancelToken") ~= token then return end
+			char:SetAttribute("NoDashCancel", nil)
+		end)
+	end
+	
+	self.ChainOpen = false
+
+	if self.CurrentSeq then
+		self.CurrentSeq:Cancel()
+		self.CurrentSeq = nil
+	end
+
+	if self.CurrentTrack and self.CurrentTrack.IsPlaying then
+		self.CurrentTrack:Stop(Configuration.M1BlendTime)
+	end
+	
+
+	local stats = WeaponData.GetWeaponStats(char)
+
+	local animCount = self.localM1Count
+	
+	char.Humanoid.AutoRotate = false
+	local weapon = controller:GetWeapon()
+	
+
+	local track
+	if weapon and weapon.HandleEffect then
+		if char:GetAttribute("IsAttacking") then return end
+		if char:GetAttribute("IsBlocking") then
+			char.Humanoid.AutoRotate = true
+			return
+		end
+		track = weapon.HandleEffect(controller, animCount)
+	else
+		print("Error")
+	end
+
+	self.CurrentTrack = track
+	lastM1Track = track
+
+	if not SkillDash.HoldForDash(char, track, M1_DASH_FREEZE) then
+		self.CurrentTrack = nil
+		return
+	end
+
+	local swing = CombatTiming.GetM1(curWeapon, animCount)
+	local animSpeed = CombatTiming.GetM1Speed(curWeapon, animCount)
+	local hitFrame = ((swing and swing.hitOffset or 0.3) * animSpeed) * 60
+	
+	
+	-- the combo finisher gets its own cue where a weapon defines one
+	local swingSound = "Swing"
+	local finisher = FINISHER_SOUND[curWeapon]
+	if finisher and animCount == WeaponData.GetStat(curWeapon, "maxM1") then
+		swingSound = finisher
+	end
+	SoundHandler.Play(swingSound, controller.Root, curWeapon)
+	
+	if char:GetAttribute("IsBlocking") then
+		if track and track.IsPlaying then
+			track:Stop(Configuration.M1BlendTime)
+		end
+		self.CurrentTrack = nil
+		char.Humanoid.AutoRotate = true
+		-- Revert the combo step back so blocking doesn't eat a swing in the chain.
+		self.localM1Count = math.max((self.localM1Count or 1) - 1, 0)
+		return
+	end
+
+	CombatEvent:FireServer("M1")
+
+	local now = os.clock()
+	if animCount >= stats.maxM1 then
+		local timing = CombatTiming.GetWeapon(curWeapon)
+		self.nextM1AllowedTime = now + ((timing and timing.combatCD) or Configuration.M1ChainCooldown)
+	else
+		self.nextM1AllowedTime = now + (swing and swing.recovery or 0)
+	end
+
+
+	if track and track.Length > 0 then
+		local sweepDuration = math.max(swing and swing.active or 0.05, 0.03)
+		hitFrame = math.max(1, math.min(hitFrame, track.Length * 60 - 2))
+		local endFrame = math.max(hitFrame + 1, track.Length * 60 - Configuration.M1EndLead * 60)
+		local Seq = Sequencer.ForTrack(track)
+			:At(hitFrame, function()
+				HitDetect.Sweep(char, "M1Hitbox", sweepDuration)
+			end)
+			:At(endFrame, function()
+				--self.ChainOpen = true
+				--self:FireBuffered()
+			end)
+			:Start()
+		self.CurrentSeq = Seq
+		track.Stopped:Once(function()
+			if self.CurrentSeq ~= Seq then return end
+			self.CurrentSeq = nil
+			Seq:Cancel()
+			self.ChainOpen = true
+			--self:FireBuffered()
+		end)
+	else
+		local sweepDuration = math.max(swing and swing.active or 0.05, 0.03)
+		task.delay(swing and swing.hitOffset or 0.3, function()
+			HitDetect.Sweep(char, "M1Hitbox", sweepDuration)
+		end)
+		local fallback = math.max(WeaponData.GetCD(char, "m1CD", animCount) - Configuration.M1EndLead, 0.05)
+		task.delay(fallback, function()
+			self.ChainOpen = true
+			--self:FireBuffered()
+		end)
+	end
+end
+
+function M1Object.DoAirM1(self)
+	local controller = self.Controller
+	if localAirM1Debounce then return end
+
+	local char = controller.Character
+	if not char or char:GetAttribute("IsUptilt") or char:GetAttribute("CanDownslam") or char:GetAttribute("IsAttacking") or char:GetAttribute("IsBlocking") or char:GetAttribute("IsStunned") then return end
+
+	local hrp = controller.Root
+	local hum = controller.Humanoid
+	local curWeapon = char:GetAttribute("CurrentWeapon")
+
+	-- Keep Air M1 responsive without allowing extreme fling velocity.
+	local vel = hrp.AssemblyLinearVelocity
+	local horizSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+	local vertSpeed = math.abs(vel.Y)
+
+	if horizSpeed > AIR_M1_MAX_HORIZONTAL_SPEED or vertSpeed > AIR_M1_MAX_VERTICAL_SPEED then return end
+
+	localAirM1Debounce = true
+
+	local wasSprinting = SprintResume.WasSprinting(controller)
+
+	local combatFolder = ReplicatedStorage.Anims.Combat[curWeapon].Combat
+	local anim = combatFolder:FindFirstChild("AirM1") or combatFolder:FindFirstChild("Combat1")
+	if not anim then
+		localAirM1Debounce = false
+		return
+	end
+
+	CombatEvent:FireServer("AirM1")
+
+	local swing = CombatTiming.GetM1(curWeapon, 1)
+	local hitOffset = (swing and swing.hitOffset) or 0.3
+
+	-- Carry starting velocity into the boost forwards.
+	local startVel = hrp.AssemblyLinearVelocity
+	local look = hrp.CFrame.LookVector * Vector3.new(1, 0, 1)
+	if look.Magnitude > 0.05 then
+		look = look.Unit
+	else
+		look = Vector3.zero
+	end
+
+	local boosted = Vector3.new(startVel.X, 0, startVel.Z) + look * AIR_M1_PUSH
+	if boosted.Magnitude > AIR_M1_PUSH_MAX then
+		boosted = boosted.Unit * AIR_M1_PUSH_MAX
+	end
+	hrp.AssemblyLinearVelocity = Vector3.new(boosted.X, startVel.Y, boosted.Z)
+
+	local track = controller.Animator:Animate({
+		Animation = anim,
+		Priority = Enum.AnimationPriority.Action4,
+		Speed = AIR_M1_ANIM_SPEED,
+		Looped = false,
+	})
+	if CancelAirDetect then
+		CancelAirDetect()
+	end
+
+	local stopped = false
+	local released = false
+	local posCheck
+	local freezeStart
+
+	local function cleanup()
+		if stopped then return end
+		stopped = true
+		if posCheck then
+			posCheck:Disconnect()
+			posCheck = nil
+		end
+		if track and track.IsPlaying then
+			track:AdjustSpeed(AIR_M1_ANIM_SPEED) -- never leave a track frozen
+		end
+		task.delay(WeaponData.GetCD(char, "airM1CD"), function()
+			localAirM1Debounce = false
+		end)
+
+		if SprintResume.ShouldResume(controller, wasSprinting) then
+			SprintResume.Restart(controller, wasSprinting)
+			return
+		end
+
+		SprintResume.ResetAutoTimer()
+
+		local idleAnim = ReplicatedStorage.Anims.Combat[curWeapon].Main
+			:FindFirstChild("EquippedIdle")
+		if idleAnim then
+			controller.Animator:Animate({
+				Animation = idleAnim,
+				Priority = Enum.AnimationPriority.Action,
+			})
+		end
+	end
+
+
+	local function release()
+		if released or stopped then return end
+		released = true
+		if track then
+			track:AdjustSpeed(AIR_M1_ANIM_SPEED)
+		end
+
+		CancelAirDetect = HitDetect.FromTrack(char, track, "AirM1Hitbox", 0.3, 0.1)
+		local effectsPlay = getWeaponEffect(char:GetAttribute("CurrentWeapon"))
+		if effectsPlay then
+			effectsPlay.Play(char, char:GetAttribute("CurrentWeapon") .. "AirM1")
+		end
+
+		local airCommit = CombatTiming.GetAirM1Commit(curWeapon)
+		if airCommit then
+			self.nextM1AllowedTime = os.clock() + airCommit
+		end
+
+		char:SetAttribute("AirM1LockUntil", os.clock() + AIR_M1_ACTION_LOCK)
+
+		CombatEvent:FireServer("AirM1Release")
+	end
+
+	posCheck = game:GetService("RunService").RenderStepped:Connect(function()
+		if stopped then return end
+		if not hrp or not hrp.Parent then
+			cleanup()
+			return
+		end
+
+		-- Stun cancels the whole swing
+		if char:GetAttribute("IsStunned")
+			or char:GetAttribute("IsSoftStunned") then
+			cleanup()
+			return
+		end
+
+		if not released then
+			local clipHit = CombatTiming.GetAirM1ClipHit(curWeapon)
+			local freezeAt = CombatTiming.GetAirM1FreezeAt(curWeapon)
+			if not freezeStart and track and track.IsPlaying
+				and track.TimePosition >= freezeAt then
+				freezeStart = os.clock()
+				track:AdjustSpeed(0)
+			end
+
+			if freezeStart then
+				if not isAirborne(char, hrp, AIR_M1_RELEASE_HEIGHT)
+					or os.clock() - freezeStart >= AIR_M1_FREEZE_MAX then
+					release()
+				end
+			end
+		end
+	end)
+
+	if track then
+		track.Stopped:Connect(cleanup)
+	end
+end
+
+function M1Object.DoUptilt(self)
+	local controller = self.Controller
+	local char = controller.Character
+	local hrp = controller.Root
+	local now = os.clock()
+
+	if controller.Humanoid.FloorMaterial == Enum.Material.Air then return end
+	
+	if localUptiltDebounce then return end
+
+	if char:GetAttribute("IsUptilt") then return end
+	if char:GetAttribute("IsStunned") then return end
+	if char:GetAttribute("IsSoftStunned") then return end
+	if char:GetAttribute("IsAttacking") then return end
+	if char:GetAttribute("IsBlocking") then return end
+	
+	
+	local curWeapon = char:GetAttribute("CurrentWeapon")
+	local anim = ReplicatedStorage.Anims.Combat[curWeapon].Combat:FindFirstChild("Uptilt")
+	if not anim then return end
+	localUptiltDebounce = true
+	
+	
+
+	local track = controller.Animator:Animate({
+		Animation = anim,
+		Priority = Enum.AnimationPriority.Action4,
+		Speed = 0.9,
+	})
+	if CancelUptiltDetect then
+		CancelUptiltDetect()
+	end
+	CancelUptiltDetect = HitDetect.FromTrack(char, track, "UptiltHitbox")
+	
+	local attach = Instance.new("Attachment")
+	attach.Name = "UptiltStartAttachment"
+	attach.Parent = hrp
+
+	local vel = Instance.new("LinearVelocity")
+	vel.Attachment0 = attach
+	vel.MaxForce = 500000
+	vel.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	vel.VectorVelocity = Vector3.zero
+	vel.Parent = hrp
+
+	local pushCancelled = false
+	local function endPush()
+		if pushCancelled then return end
+		pushCancelled = true
+		if vel and vel.Parent then vel:Destroy() end
+		if attach and attach.Parent then attach:Destroy() end
+	end
+
+	task.delay(UPTILT_PUSH_DELAY, function()
+		if pushCancelled or not char.Parent then endPush() return end
+		-- don't lunge if the swing got interrupted during the windup
+		if char:GetAttribute("IsStunned")
+			or char:GetAttribute("IsSoftStunned")
+			or char:GetAttribute("IsBlocking") then
+			endPush()
+			return
+		end
+
+		local startTime = os.clock()
+		local conn
+		conn = RunService.Heartbeat:Connect(function()
+			if pushCancelled or not char.Parent or not hrp.Parent then
+				conn:Disconnect()
+				endPush()
+				return
+			end
+			-- cut the push short if we get hit out of it
+			if char:GetAttribute("IsStunned") or char:GetAttribute("IsSoftStunned") then
+				conn:Disconnect()
+				endPush()
+				return
+			end
+
+			local alpha = math.clamp((os.clock() - startTime) / UPTILT_PUSH_TIME, 0, 1)
+			local dir = hrp.CFrame.LookVector * Vector3.new(1, 0, 1)
+			if dir.Magnitude > 0.01 then
+				dir = dir.Unit
+			else
+				dir = Vector3.zero
+			end
+
+			vel.VectorVelocity = dir * (UPTILT_PUSH_STRENGTH * (1 - alpha))
+
+			if alpha >= 1 then
+				conn:Disconnect()
+				endPush()
+			end
+		end)
+	end)
+	
+	SoundHandler.Play("Swing", controller.Root, curWeapon)
+
+	CombatEvent:FireServer("Uptilt")
+	controller.Camera:TweenFOV({
+		FOV = 75,
+		In = TweenInfo.new(0.1),
+		Hold = 0.3,
+		Out = TweenInfo.new(0.2),
+		EndFOV = 70,
+	})
+
+	local conn
+	conn = char:GetAttributeChangedSignal("IsUptilt"):Connect(function()
+		if char:GetAttribute("IsUptilt") then
+			conn:Disconnect()
+			controller.Camera:TweenFOV({
+				FOV = 80,
+				In = TweenInfo.new(0.3),
+			})
+		else
+			conn:Disconnect()
+			controller.Camera:Reset()
+		end
+	end)
+
+	task.delay(WeaponData.GetCD(char, "uptiltCD"), function()
+		localUptiltDebounce = false
+	end)
+end
+
+function M1Object.DoDownslam(self)
+	local controller = self.Controller
+	local char = controller.Character
+
+	if localDownslamDebounce then return end
+	localDownslamDebounce = true
+
+	local curWeapon = char:GetAttribute("CurrentWeapon")
+	local anim = ReplicatedStorage.Anims.Combat[curWeapon].Combat:FindFirstChild("Downslam")
+	if not anim then return end
+
+	local track = controller.Animator:Animate({
+		Animation = anim,
+		Priority = Enum.AnimationPriority.Action4,
+	})
+	if CancelDownslamDetect then
+		CancelDownslamDetect()
+	end
+	CancelDownslamDetect = HitDetect.FromTrack(char, track, "DownslamHitbox")
+	
+	SoundHandler.Play("Swing", controller.Root, curWeapon)
+	CombatEvent:FireServer("Downslam")
+
+	controller.Camera:TweenFOV({
+		FOV = 85,
+		In = TweenInfo.new(0.05),
+		Hold = 0.2,
+		Out = TweenInfo.new(0.3),
+		EndFOV = 70,
+	})
+
+	CamShakeEvent:FireServer("Downslam")
+
+	local conn
+	conn = char:GetAttributeChangedSignal("IsUptilt"):Connect(function()
+		if not char:GetAttribute("IsUptilt") then
+			conn:Disconnect()
+			controller.Camera:Reset()
+		end
+	end)
+
+	task.delay(WeaponData.GetCD(char, "downslamCD"), function()
+		localDownslamDebounce = false
+	end)
+end
+
+function M1Object.Clean(self)
+	self.__Trove:Clean()
+end
+
+-- Hi
+
+return M1Handler
