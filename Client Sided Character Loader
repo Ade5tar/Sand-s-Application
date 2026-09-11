@@ -1,0 +1,514 @@
+function CharacterHandler.new(character)
+	
+	local self = setmetatable({}, {__index = CharacterObject}) :: CharacterType
+
+	self._Trove = Trove.new()
+	self._Trove:AttachToInstance(character)
+	self.Player = Players:GetPlayerFromCharacter(character)
+	self.Character = character
+	self.Humanoid = character:WaitForChild("Humanoid") :: Humanoid
+	self.Root = character:WaitForChild("HumanoidRootPart") :: BasePart
+	self._localEquipped = true  -- weapons are always equipped; no unequip
+	self.Attributes = Attributes(character)
+	self.Animator = Animator.new(character)
+	CooldownHandler.Reset(character, "equip")
+
+	self._Trove:Add(self.Animator.__Trove)
+	
+	local loadedWeapons = {}
+
+	local function loadedWeaponsFromFolder(folder)
+		if not folder then
+			warn("CharacterHandler: Weapons folder not found")
+			return
+		end
+		for _, module in folder:GetChildren() do
+			if module:IsA("ModuleScript") then
+				local ok, weapon = pcall(require, module)
+				if ok and weapon.Name then
+					loadedWeapons[weapon.Name] = weapon
+				else
+					warn("CharacterHandler: Failed to load weapon:", module.Name, weapon)
+				end
+			end
+		end
+	end
+
+	local function loadWeaponByName(weaponName)
+		if not weaponName then return false end
+		if loadedWeapons[weaponName] then return true end
+
+		local weaponFolder = ReplicatedStorage.Weapons:FindFirstChild(weaponName)
+		if not weaponFolder then
+			warn("CharacterHandler: no Weapons folder for", weaponName)
+			return false
+		end
+		loadedWeaponsFromFolder(weaponFolder:FindFirstChild("Scripts"))
+		return loadedWeapons[weaponName] ~= nil
+	end
+
+	
+	local weaponName = self.Character:GetAttribute("CurrentWeapon")
+	if not weaponName then
+		local deadline = os.clock() + 5
+		while not weaponName and os.clock() < deadline and self.Character.Parent do
+			task.wait(0.05)
+			weaponName = self.Character:GetAttribute("CurrentWeapon")
+		end
+		if not weaponName then
+			warn("CharacterHandler: CurrentWeapon never replicated; falling back to Fists")
+		end
+	end
+
+	loadWeaponByName(weaponName or "Fists")
+
+	self._weapons = loadedWeapons
+	self._loadWeaponByName = loadWeaponByName
+
+	
+	self._Trove:Connect(
+		self.Character:GetAttributeChangedSignal("CurrentWeapon"),
+		function()
+			loadWeaponByName(self.Character:GetAttribute("CurrentWeapon"))
+		end
+	)
+
+	if IsClient then
+		local InputHandler = require(Components.InputHandler)
+		local ActionHandler = require(Components.ActionHandler)
+		local Camera = require(Components.Camera)
+		local M1Handler = require(Components.M1Handler)
+		local BlockHandler = require(Components.BlockHandler)
+		local UIHandler = require(Components.UIHandler)
+
+		local Movement = Components.ActionHandler.Movement
+		local WallStep = require(Movement.WallStep)
+		local WallRun = require(Movement.WallRun)
+		local DoubleJump = require(Movement.DoubleJump)
+
+		self.Input = InputHandler.new()
+		self.Camera = Camera.new()
+		self.Actions = ActionHandler.new(self)
+		self.M1Handler = M1Handler.new(self)
+		self.BlockHandler = BlockHandler.new(self)
+
+		self._Trove:Add(function()
+			self.Input.__Trove:Clean()
+		end)
+		self._Trove:Add(self.Actions.__Trove)
+		self._Trove:Add(self.Camera.__Trove)
+		self._Trove:Add(self.M1Handler.__Trove)
+		self._Trove:Add(self.BlockHandler.__Trove)
+		
+		self.UI = UIHandler.new(self)
+		self.UI:Show()
+		
+		self._Trove:Add(function()
+			self.UI:Clean()
+		end)
+
+		
+		local char = self.Character
+		for i = 1, 4 do
+			self._Trove:Connect(
+				char:GetAttributeChangedSignal("EquippedSkill_" .. i),
+				function()
+					self.UI:RebuildHotbar(self.Actions)
+				end
+			)
+		end
+
+		local initialBuildThread = task.delay(0.5, function()
+			if self.Character and self.Character.Parent then
+				self.UI:RebuildHotbar(self.Actions)
+			end
+		end)
+		self._Trove:Add(initialBuildThread, "cancel")
+		
+		local Map = require(Components.InputHandler.Map)
+		local skillNumbers = {}
+		for _, keyData in Map do
+			if keyData.Number and keyData.Action then
+				skillNumbers[keyData.Action] = keyData.Number
+			end
+		end
+
+		-- Sort skills by their keybind number
+		local sortedSkills = {}
+		for _, skill in self.Actions.ActionMap.Skill do
+			if skill.Cooldown and skill.Cooldown > 0 then
+				table.insert(sortedSkills, skill)
+			end
+		end
+
+		table.sort(sortedSkills, function(a, b)
+			local numA = skillNumbers[a.Name] or 999
+			local numB = skillNumbers[b.Name] or 999
+			return numA < numB
+		end)
+
+		
+		if UIS.TouchEnabled then
+			local plr = self.Player
+			if plr then
+				local function getWallJumpButton()
+					local playerGui = plr:FindFirstChild("PlayerGui")
+					if not playerGui then return nil end
+					local combatUI = playerGui:FindFirstChild("CombatUI")
+					if not combatUI then return nil end
+					return combatUI:FindFirstChild("WallJump", true)
+				end
+
+				self._Trove:Add(WallStep.StepStarted:Connect(function()
+					local button = getWallJumpButton()
+					if button then button.Visible = true end
+				end))
+
+				self._Trove:Add(WallStep.StepEnded:Connect(function()
+					local button = getWallJumpButton()
+					if button then button.Visible = false end
+				end))
+			end
+		end
+		
+		local spaceReleased = true
+		
+		self._Trove:Connect(
+			self.Humanoid.StateChanged,
+			function(_, newState)
+				if newState == Enum.HumanoidStateType.Freefall then
+					-- Small delay so initial jump doesn't trigger double jump
+					task.delay(0.3, function()
+						spaceReleased = true
+					end)
+				elseif newState == Enum.HumanoidStateType.Landed
+					or newState == Enum.HumanoidStateType.Running
+					or newState == Enum.HumanoidStateType.Jumping then
+					spaceReleased = false
+				end
+			end
+		)
+
+		self._Trove:Connect(
+			UIS.InputEnded,
+			function(input)
+				
+				if input.KeyCode ~= Enum.KeyCode.Space
+					and input.KeyCode ~= Enum.KeyCode.ButtonA then return end
+				spaceReleased = true
+			end
+		)
+		
+		-- JumpRequest handles all air actions
+		self._Trove:Connect(
+			UIS.JumpRequest,
+			function()
+				
+				local char = self.Character
+				local hum = self.Humanoid
+				local hrp = self.Root
+
+				if char:GetAttribute("Sliding") then
+					local slideSkill = self.Actions.ActionMap.Combat["Slide"]
+					if slideSkill and slideSkill.JumpCancel then
+						slideSkill.JumpCancel(self)
+					end
+					return
+				end
+
+				if hum.FloorMaterial ~= Enum.Material.Air then return end
+
+				local params = RaycastParams.new()
+				params.FilterDescendantsInstances = {char}
+				params.FilterType = Enum.RaycastFilterType.Exclude
+
+				local function isWall(ray)
+					return ray and ray.Normal:Dot(Vector3.new(0, 1, 0)) < 0.3
+				end
+
+				local forward
+				if UIS.TouchEnabled then
+					forward = Vector3.new(
+						hrp.CFrame.LookVector.X, 0,
+						hrp.CFrame.LookVector.Z).Unit
+				else
+					local cameraLook = workspace.CurrentCamera.CFrame.LookVector
+					forward = Vector3.new(cameraLook.X, 0, cameraLook.Z).Unit
+				end
+
+				local hasForwardWall = workspace:Raycast(
+					hrp.Position, forward * 5, params)
+				local hasRightWall = workspace:Raycast(
+					hrp.Position, hrp.CFrame.RightVector * 3.5, params)
+				local hasLeftWall = workspace:Raycast(
+					hrp.Position, -hrp.CFrame.RightVector * 3.5, params)
+
+				if isWall(hasForwardWall) and stateCheck(char) then
+					WallStep.Execute(self)
+				elseif isWall(hasRightWall) or isWall(hasLeftWall) and stateCheck(char) then
+					WallRun.Execute(self)
+				else
+					if not spaceReleased or not stateCheck(char) then return end
+					
+					local state = hum:GetState()
+					if state == Enum.HumanoidStateType.Freefall
+						or state == Enum.HumanoidStateType.Jumping then
+						-- Check height above ground
+						local params = RaycastParams.new()
+						params.FilterDescendantsInstances = {char}
+						params.FilterType = Enum.RaycastFilterType.Exclude
+						local groundRay = workspace:Raycast(
+							hrp.Position,
+							Vector3.new(0, -6.5, 0),
+							params
+						)
+						if not groundRay then
+							spaceReleased = false
+							DoubleJump.Execute(self)
+						end
+					end
+				end
+			end
+		)
+
+		-- Reset on landing
+		self._Trove:Connect(
+			self.Humanoid.StateChanged,
+			function(_, newState)
+				if newState == Enum.HumanoidStateType.Landed then
+					DoubleJump.Reset()
+					WallStep.Reset()
+					WallRun.Reset()
+				end
+			end
+		)
+		
+		--Fling prevention
+		local function watchVelocity()
+			local hrp = self.Root
+			local hum = self.Humanoid
+			local char = self.Character
+
+			local params = RaycastParams.new()
+			local excluded = {char, workspace.HITBOXES, workspace.NPCs, workspace.VFX}
+			for _, plr in game:GetService("Players"):GetPlayers() do
+				if plr.Character then
+					table.insert(excluded, plr.Character)
+				end
+			end
+			params.FilterDescendantsInstances = excluded
+			params.FilterType = Enum.RaycastFilterType.Exclude
+			params.RespectCanCollide = true
+
+			local MAX_DOWNWARD_SPEED = 60
+			local MAX_SPEED = 70  
+			local GROUND_CHECK_DIST = 10
+			local SURFACE_CHECK_DIST = 8
+
+			local function killVelocity(newVel)
+				-- Remove all velocity objects
+				for _, obj in hrp:GetChildren() do
+					if obj:IsA("LinearVelocity")
+						or obj:IsA("BodyVelocity") then
+						obj:Destroy()
+					end
+				end
+				hrp.AssemblyLinearVelocity = newVel
+			end
+
+			local function raycast(origin, direction)
+				return workspace:Raycast(origin, direction, params)
+			end
+
+			
+			self._Trove:Connect(
+				game:GetService("RunService").Heartbeat,
+				function()
+					SprintResume.AutoSprintTick(self)
+				end
+			)
+
+			
+			self._Trove:Connect(
+				game:GetService("RunService").Heartbeat,
+				function()
+					if self.M1Handler and self.M1Handler.ProcessQueuedInput then
+						self.M1Handler:ProcessQueuedInput()
+					end
+				end
+			)
+
+			self._Trove:Connect(
+				game:GetService("RunService").Heartbeat,
+				function()
+					if not hrp or not hrp.Parent then return end
+					if hum.Health <= 0 then return end
+					if char:GetAttribute("IsWallStepping") then return end
+					if char:GetAttribute("IsWallRunning") then return end
+					if char:GetAttribute("CritDashing") then return end
+					if char:GetAttribute("IsRagdolled") then return end
+					if hrp:FindFirstChild("KnockbackVelocity") then return end
+
+					local vel = hrp.AssemblyLinearVelocity
+					local speed = vel.Magnitude
+					if speed < 10 then return end
+
+					local downwardSpeed = -vel.Y
+
+					
+					if downwardSpeed > MAX_DOWNWARD_SPEED then
+						local groundRay = raycast(
+							hrp.Position, Vector3.new(0, -GROUND_CHECK_DIST, 0))
+						if groundRay then
+							killVelocity(Vector3.new(vel.X, -MAX_DOWNWARD_SPEED, vel.Z))
+							return
+						end
+					end
+
+					
+					if speed > MAX_SPEED then
+						local velDir = vel.Unit
+						local surfaceRay = raycast(
+							hrp.Position, velDir * SURFACE_CHECK_DIST)
+						if surfaceRay then
+							local normalY = surfaceRay.Normal:Dot(Vector3.new(0, 1, 0))
+							if normalY > 0.05 then
+								-- Floor or ramp
+								killVelocity(Vector3.new(
+									vel.X * 0.2,
+									math.max(vel.Y, 0),
+									vel.Z * 0.2
+									))
+								return
+							else
+								-- Wall
+								killVelocity(Vector3.new(0, vel.Y, 0))
+								return
+							end
+						end
+					end
+
+					
+					local horizVel = Vector3.new(vel.X, 0, vel.Z)
+					if horizVel.Magnitude > MAX_SPEED then
+						local wallRay = raycast(
+							hrp.Position, horizVel.Unit * SURFACE_CHECK_DIST)
+						if wallRay 
+							and wallRay.Normal:Dot(Vector3.new(0, 1, 0)) < 0.3 then
+							killVelocity(Vector3.new(0, vel.Y, 0))
+							return
+						end
+					end
+
+					
+					local lookDir = hrp.CFrame.LookVector
+					local lookSpeed = vel:Dot(lookDir)
+					if lookSpeed > MAX_SPEED * 0.7 then
+						local lookRay = raycast(
+							hrp.Position, lookDir * SURFACE_CHECK_DIST)
+						if lookRay then
+							local normalY = lookRay.Normal:Dot(Vector3.new(0, 1, 0))
+							if normalY > 0.05 then
+								-- Floor or ramp
+								killVelocity(Vector3.new(
+									vel.X * 0.2,
+									math.max(vel.Y, 0),
+									vel.Z * 0.2
+									))
+							else
+								-- Wall
+								killVelocity(Vector3.new(0, vel.Y, 0))
+							end
+							return
+						end
+					end
+
+					-- 5. Slide speed cap
+					if char:GetAttribute("Sliding") then
+						local horizSpeed = horizVel.Magnitude
+						if horizSpeed > 60 then
+							local capped = horizVel.Unit * 60
+							hrp.AssemblyLinearVelocity = Vector3.new(
+								capped.X, vel.Y, capped.Z)
+						end
+					end
+				end
+			)
+		end
+
+		watchVelocity()
+
+
+		local function settleIntoEquippedIdle(mainFolder, blend)
+			if not self.Character or not self.Character.Parent then return end
+			local idleAnim = mainFolder and mainFolder:FindFirstChild("EquippedIdle")
+			if idleAnim then
+				self.Animator:Animate({
+					Animation = idleAnim,
+					Priority = Enum.AnimationPriority.Action,
+					FadeTime = blend,
+				})
+			end
+		end
+
+
+		do
+			local char = self.Character
+			local curWeapon = char:GetAttribute("CurrentWeapon") or "Fists"
+			local main = ReplicatedStorage.Anims.Combat:FindFirstChild(curWeapon)
+			main = main and main:FindFirstChild("Main")
+			local equipAnim = main and main:FindFirstChild("Equip")
+			if equipAnim then
+				local equipTrack = self.Animator:Animate({
+					Animation = equipAnim,
+					Priority = Enum.AnimationPriority.Action,
+				})
+
+
+				task.spawn(function()
+					local IDLE_BLEND = 0.15
+					local FALLBACK = 0.6
+					if equipTrack then
+						local t0 = os.clock()
+						while equipTrack.Length == 0 and os.clock() - t0 < 3 do
+							task.wait(0.05)
+						end
+						local len = equipTrack.Length
+						if len > 0 then
+							local hold = math.max(len - IDLE_BLEND, 0)
+							task.wait(hold)
+						else
+							task.wait(FALLBACK) -- never resolved a length
+						end
+					else
+						task.wait(FALLBACK)
+					end
+
+					settleIntoEquippedIdle(main, IDLE_BLEND)
+				end)
+
+				local soundFolder = ReplicatedStorage.Sounds.Combat:FindFirstChild(curWeapon)
+				local equipSound = soundFolder and soundFolder:FindFirstChild("Equip")
+				if equipSound then
+					SoundHandler.Play(equipSound, self.Root, curWeapon)
+				end
+			end
+		end
+
+
+		self._Trove:Connect(
+			self.Character:GetAttributeChangedSignal("CurrentWeapon"),
+			function()
+				local newWeapon = self.Character:GetAttribute("CurrentWeapon")
+				if not newWeapon then return end
+				local newMain = ReplicatedStorage.Anims.Combat:FindFirstChild(newWeapon)
+				newMain = newMain and newMain:FindFirstChild("Main")
+				settleIntoEquippedIdle(newMain, 0.2)
+			end
+		)
+
+		self:Listen()
+	end
+
+	return self
+end
