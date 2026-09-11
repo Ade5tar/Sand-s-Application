@@ -1,0 +1,322 @@
+SkillService.cosCheck = SkillHitLogic.cosCheck
+SkillService.fireDamage = SkillHitLogic.fireDamage
+SkillService.isHittable = SkillHitLogic.isHittable
+SkillService.handleBlock = SkillHitLogic.handleBlock
+SkillService.Parry = SkillHitLogic.Parry
+SkillService.GuardBreak = SkillHitLogic.GuardBreak
+SkillService.DashHit = SkillHitLogic.DashHit
+SkillService.FireHitFX = SkillHitLogic.FireHitFX
+
+
+local counterHooks = {}
+function SkillService.SetCounterHook(fn)
+	if type(fn) == "function" and not table.find(counterHooks, fn) then
+		table.insert(counterHooks, fn)
+	end
+end
+
+
+function SkillService.CheckCounter(char, eChar)
+	for _, hook in counterHooks do
+		if hook(eChar, char) then
+			SkillService.HitboxDelete(char)
+			return true
+		end
+	end
+	return false
+end
+
+SkillService.linearVelo = SkillMovementLogic.linearVelo
+SkillService.FreezeOnStun = SkillMovementLogic.FreezeOnStun
+SkillService.WallSlam = SkillMovementLogic.WallSlam
+SkillService.GroundSlam = SkillMovementLogic.GroundSlam
+SkillService.GroundCrater = SkillMovementLogic.GroundCrater
+SkillService.ArcKnockback = SkillMovementLogic.ArcKnockback
+SkillService.CleanupUptilt = AirCombatHandler.CleanupUptilt
+SkillService.CleanupVictim = AirCombatHandler.CleanupVictim
+SkillService.ReleaseHold = AirCombatHandler.ReleaseHold
+
+
+function SkillService.RefreshUptilt(char, eChar, duration)
+	AirCombatHandler.RefreshUptilt(char, eChar, duration)
+end
+
+
+function SkillService.SkillUptilt(char, eChar, opts)
+	return AirCombatHandler.SkillUptilt(char, eChar, opts)
+end
+
+function SkillService.ValidateSkill(char, skillName)
+	local player = Players:GetPlayerFromCharacter(char)
+	if not player then return nil, "awakening requires a player" end
+	local data = DataService.GetData(player)
+	if not data then return nil, "player data is not loaded" end
+	
+	skillName = skillName:gsub("%s", "")
+	local skill = loadedSkills[skillName]
+	if not skill then
+		warn("ValidateSkill: skill not found in registry:", skillName)
+		return false
+	end
+
+	if skill.Category and skill.Category ~= "Universal" and not StateManager.GetState(char, "IsAwakened") then
+		local currentWeapon = StateManager.GetState(char, "CurrentWeapon")
+		if currentWeapon ~= skill.Category then
+			warn("ValidateSkill: weapon mismatch:", char.Name, skillName,
+				"needs", skill.Category, "has", currentWeapon)
+			return false
+		end
+	elseif StateManager.GetState(char, "IsAwakened") then
+		local curAwakening = data.equippedAwakening
+		if skill.Category ~= curAwakening then
+			warn("ValidateSkill: awakening mismatch:", char.Name, skillName,
+				"needs", skill.Category, "has", curAwakening)
+			return false
+		end
+	end
+
+	local cooldown = skill.Cooldown or 0
+	if cooldown > 0 then
+		if not CooldownHandler.Check(char, skillName, cooldown) then
+			warn("ValidateSkill: cooldown violation:", char.Name, skillName)
+			return false
+		end
+
+	end
+
+	return true
+end
+
+function SkillService.CommitSkill(char, skillName, charges)
+	skillName = skillName:gsub("%s", "")
+	local skill = loadedSkills[skillName]
+	if not skill then
+		warn("CommitSkill: skill not found in loadedSkills:", skillName)
+		local keys = {}
+		for k in loadedSkills do table.insert(keys, k) end
+		print("Loaded skills:", table.concat(keys, ", "))
+		return
+	end
+
+	local cooldown = skill.Cooldown or 0
+	if cooldown > 0 then
+		CooldownHandler.Set(char, skillName, cooldown)
+	end
+
+	activeSkills[char] = {
+		name = skillName,
+		charges = charges or 1,
+		expires = os.clock() + 20,
+	}
+end
+
+local function tokenValid(char, skillName)
+	local entry = activeSkills[char]
+	if not entry or entry.name ~= skillName then return nil end
+	if entry.expires and os.clock() > entry.expires then
+		activeSkills[char] = nil
+		print(entry.expires, os.clock())
+		return nil
+	end
+	return entry
+end
+
+function SkillService.ConsumeSkill(char, skillName)
+	skillName = skillName:gsub("%s", "")
+	local entry = tokenValid(char, skillName)
+	if not entry then
+		return false
+	end
+
+	entry.charges -= 1
+	if entry.charges <= 0 then
+		activeSkills[char] = nil
+	end
+
+	return true
+end
+
+function SkillService.CheckSkill(char, skillName)
+	skillName = skillName:gsub("%s", "")
+	return tokenValid(char, skillName) ~= nil
+end
+
+function SkillService.ClearSkill(char)
+	activeSkills[char] = nil
+end
+
+local function getHitboxExclude(char)
+	local excluded = {
+		char,
+		workspace.VFX,
+		workspace.Debris,
+	}
+	for _, plr in Players:GetPlayers() do
+		local plrChar = plr.Character
+		if not plrChar then continue end
+		for _, child in plrChar:GetChildren() do
+			if child.Name:match("Model$") then
+				table.insert(excluded, child)
+			end
+		end
+	end
+	for _, npc in workspace.NPCs:GetChildren() do
+		for _, child in npc:GetChildren() do
+			if child.Name:match("Model$") then
+				table.insert(excluded, child)
+			end
+		end
+	end
+	return excluded
+end
+
+function SkillService.HitboxCreate(char, duration, hitboxType, allowChain, maxHits, cooldown, forward, spawnCFrame, isAwakening)
+	if not char then return end
+	local player = Players:GetPlayerFromCharacter(char)
+	if not player then return nil, "awakening requires a player" end
+	local data = DataService.GetData(player)
+	if not data then return nil, "player data is not loaded" end
+	
+	
+	cooldown = cooldown or 0.05
+	if hitboxCooldowns[char] and not allowChain then return end
+	if activeHitboxes[char] and not allowChain then
+		local toClean = activeHitboxes[char]
+		activeHitboxes[char] = nil
+		if toClean._cancel then toClean._cancel() end
+		task.defer(function() toClean:WrappedClean() end)
+	end
+	hitboxCooldowns[char] = true
+	task.delay(cooldown, function()
+		hitboxCooldowns[char] = nil
+	end)
+	local rootPart = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChild("Humanoid")
+	if not rootPart or not hum or hum.Health <= 0 then return end
+	if StateManager.GetState(char, "IsStunned") or StateManager.GetState(char, "IsSoftStunned") then return end
+	
+	local hitboxTemplate
+	local size
+	
+	if StateManager.GetState(char, "IsAwakened") then
+		local folderName = isAwakening and "AwakeningHitboxes" or "SkillHitboxes"
+		local curAwakening = data.equippedAwakening
+		local skillHitboxFolder = ReplicatedStorage.Modules.CharacterHandler.Components.ActionHandler.Awakenings.AwakeningVariants:FindFirstChild(curAwakening).AwakeningHitboxes
+		if not skillHitboxFolder then
+			warn(("Hitbox folder missing: ReplicatedStorage.%s (for '%s')")
+				:format(folderName, tostring(hitboxType)))
+			return
+		end
+		
+		local hitboxGroup = skillHitboxFolder:FindFirstChild(hitboxType)
+		hitboxTemplate = hitboxGroup
+			and hitboxGroup:FindFirstChild(hitboxType .. "Hitbox")
+		if not hitboxTemplate then
+			warn(("Hitbox template missing: %s.%s.%sHitbox")
+				:format(folderName, tostring(hitboxType), tostring(hitboxType)))
+			return
+		end
+
+		SkillService.RegisterHitboxActive(char)
+		size = hitboxTemplate.Size
+	else
+		local folderName = "SkillHitboxes"
+		local skillHitboxFolder = ReplicatedStorage:FindFirstChild(folderName)
+		if not skillHitboxFolder then
+			warn(("Hitbox folder missing: ReplicatedStorage.%s (for '%s')")
+				:format(folderName, tostring(hitboxType)))
+			return
+		end
+
+		local hitboxGroup = skillHitboxFolder:FindFirstChild(hitboxType)
+		hitboxTemplate = hitboxGroup
+			and hitboxGroup:FindFirstChild(hitboxType .. "Hitbox")
+		if not hitboxTemplate then
+			warn(("Hitbox template missing: %s.%s.%sHitbox")
+				:format(folderName, tostring(hitboxType), tostring(hitboxType)))
+			return
+		end
+
+		SkillService.RegisterHitboxActive(char)
+		size = hitboxTemplate.Size
+	end
+	
+	
+
+	
+
+	local hitbox
+	if type(forward) == "number" then
+		-- Custom forward offset: 
+		local fixedCFrame = spawnCFrame 
+			or (rootPart.CFrame * CFrame.new(0, 0, -forward))
+		hitbox = HitboxHandler.new({
+			Origin = fixedCFrame,
+			Template = hitboxTemplate,
+			Exclude = getHitboxExclude(char),
+			Duration = math.clamp(duration, 0.05, 0.35),
+			SubSteps = 1,
+			Debug = false,
+			AllowMultiHit = maxHits ~= nil,
+			Attacker = char,
+		})
+	else
+		local forwardOffset = (forward == false) and 0 or -(size.Z / 2 + 0.5)
+		hitbox = HitboxHandler.new({
+			OriginPart = rootPart,
+			OriginOffset = CFrame.new(0, 0, forwardOffset),
+			Origin = rootPart.CFrame * CFrame.new(0, 0, forwardOffset),
+			Template = hitboxTemplate,
+			Exclude = getHitboxExclude(char),
+			Duration = math.clamp(duration, 0.05, 1),
+			SubSteps = 5,
+			Attacker = char,
+			Debug = false,
+			AllowMultiHit = maxHits ~= nil,
+		})
+	end
+
+	activeHitboxes[char] = hitbox
+	local hitCount = 0
+	local lastHitTime = 0
+	local HIT_INTERVAL = maxHits and (duration / maxHits) or 0
+
+	hitbox.HitSignal:Connect(function(hitCharacters)
+		if maxHits then
+			local now = os.clock()
+			if now - lastHitTime < HIT_INTERVAL then return end
+			lastHitTime = now
+		end
+		for _, enemyChar in ipairs(hitCharacters) do
+			if StateManager.GetState(char, "IsStunned")
+				or StateManager.GetState(char, "IsSoftStunned")
+				or StateManager.GetState(char, "IsBlocking") then
+				SkillService.HitboxDelete(char)
+				break
+			end
+			if maxHits and hitCount >= maxHits then break end
+			if SkillService.CheckClash(char, enemyChar) then
+				SkillService.ResolveClash(char, enemyChar)
+				continue
+			end
+			--if not StateManager.GetState(enemyChar, "Iframe") then
+				local skill = loadedSkills[hitboxType]
+				if skill and skill.HitLogic then
+					if SkillService.CheckCounter(char, enemyChar) then break end
+					skill.HitLogic(char, enemyChar)
+					if maxHits then hitCount += 1 end
+				else
+				warn("No HitLogic found for:", hitboxType)
+			end
+		end
+	end)
+
+	hitbox.MissedSignal:Connect(function()
+		local skill = loadedSkills[hitboxType]
+		if skill and skill.Missed then
+			skill.Missed(char)
+		end
+	end)
+	hitbox:Start()
+	SkillService.ClearClashEntry(char)
+end
