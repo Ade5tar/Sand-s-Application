@@ -1,0 +1,240 @@
+-- PS: I did not make this from scratch, I built on this to allow it to support mobile inputs, console inputs, and inputs for my whole game.
+
+function ActionHandler.new(controller)
+	local self = setmetatable({}, {__index = ActionObject}) :: ActionType
+	self.__Trove = Trove.new()
+	self.Controller = controller
+	self.ActionMap = {
+		Combat = {},
+		Skill = {},
+		Awakening = {},
+		Movement = {},
+	}
+	self._skillBinds = {} 
+
+	
+	local Combat = script.Combat
+	for _, skillModule in Combat:GetChildren() do
+		local skill = require(skillModule)
+		skill.Name = skill.Name or skillModule.Name
+		self.ActionMap.Combat[skillModule.Name] = skill
+		if skill.End then
+
+
+			local isSprint = skillModule.Name == "Sprint"
+			self.ActionMap.Combat[skillModule.Name .. "End"] = {
+				Execute = function(c) skill.End(c, isSprint) end, Cooldown = 0,
+				Name = skillModule.Name .. "End",
+			}
+		end
+		if skill.JumpCancel and skillModule.Name == "Slide" then
+			self.ActionMap.Combat["JumpOrSlideCancel"] = {
+				Execute = function(c)
+					if c.Attributes.Sliding then skill.JumpCancel(c) end
+				end,
+				Cooldown = 0, Name = "JumpOrSlideCancel",
+			}
+		end
+	end
+
+	
+	local Skills = script:FindFirstChild("Skills")
+	if Skills then
+		for _, skillModule in Skills:GetChildren() do
+			local skill = require(skillModule)
+			skill.Name = skill.Name or skillModule.Name
+			self.ActionMap.Skill[skillModule.Name] = skill
+		end
+	end
+
+	
+	local Awakenings = script:FindFirstChild("Awakenings")
+	local AwakeningVariants = Awakenings and Awakenings:FindFirstChild("AwakeningVariants")
+	if AwakeningVariants then
+		for _, awakeningModule in AwakeningVariants:GetChildren() do
+			if not awakeningModule:IsA("ModuleScript") and not awakeningModule:IsA("Folder") then continue end
+
+			if awakeningModule:IsA("ModuleScript") then
+				local awakening = require(awakeningModule)
+				local id = awakening.Id or awakeningModule.Name
+				awakening.Name = awakening.Name or awakeningModule.Name
+				self.ActionMap.Awakening[id] = awakening
+			end
+
+			local variantFolder = awakeningModule:IsA("Folder") and awakeningModule or awakeningModule.Parent
+			local awakeningSkills = awakeningModule:FindFirstChild("Skills")
+
+			if awakeningSkills then
+				for _, skillModule in awakeningSkills:GetChildren() do
+					if skillModule:IsA("ModuleScript") then
+						local skill = require(skillModule)
+						skill.Name = skill.Name or skillModule.Name
+						--print("Loaded Awakening Skill:", skill.Name)
+						self.ActionMap.Skill[skillModule.Name] = skill
+					end
+				end
+			end
+		end
+	end
+
+	local Movement = script:FindFirstChild("Movement")
+	if Movement then
+		for _, skillModule in Movement:GetChildren() do
+			local skill = require(skillModule)
+			skill.Name = skill.Name or skillModule.Name
+			self.ActionMap.Movement[skillModule.Name] = skill
+			if skill.End then
+				self.ActionMap.Movement[skillModule.Name .. "End"] = {
+					Execute = skill.End, Cooldown = 0,
+					Name = skillModule.Name .. "End",
+				}
+			end
+		end
+	end
+
+	
+	self:RebuildSkillBinds()
+
+	
+	local char = controller.Character
+	for i = 1, 4 do
+		local attrName = "EquippedSkill_" .. i
+		self.__Trove:Connect(
+			char:GetAttributeChangedSignal(attrName),
+			function()
+				self:RebuildSkillBinds()
+				
+				if controller.UI then
+					controller.UI:RebuildHotbar(self)
+				end
+			end
+		)
+	end
+
+	task.spawn(function()
+		local function equippedSignature()
+			local parts = {}
+			for i = 1, 6 do
+				parts[i] = tostring(char:GetAttribute("EquippedSkill_" .. i))
+			end
+			return table.concat(parts, "|")
+		end
+
+		local lastSig = nil
+		local sawAny = false
+		local deadline = os.clock() + 8 
+
+		while char.Parent and os.clock() < deadline do
+			local sig = equippedSignature()
+			if sig ~= lastSig then
+				lastSig = sig
+				self:RebuildSkillBinds()
+				if controller.UI then
+					controller.UI:RebuildHotbar(self)
+				end
+				if sig ~= "nil|nil|nil|nil|nil|nil" then
+					sawAny = true
+				end
+			end
+
+			if sawAny then
+				task.wait(0.5)
+				if equippedSignature() == sig then break end
+			else
+				task.wait(0.2)
+			end
+		end
+	end)
+
+	return self
+end
+
+function ActionObject.RebuildSkillBinds(self)
+	local char = self.Controller.Character
+
+	
+	for i = 1, 4 do
+		ContextActionService:UnbindAction("SkillSlot_" .. i)
+	end
+	self._skillBinds = {}
+
+	
+	for i = 1, 4 do
+		local skillId = char:GetAttribute("EquippedSkill_" .. i)
+		if not skillId then continue end
+
+		local skill = self.ActionMap.Skill[skillId]
+		if not skill then continue end
+
+		local keyCode = SLOT_KEYS[i]
+		if not keyCode then continue end
+
+		self._skillBinds[i] = skillId
+
+		local capturedSkill = skill
+		ContextActionService:BindAction(
+			"SkillSlot_" .. i,
+			function(_, inputState, _)
+				if inputState ~= Enum.UserInputState.Begin then return end
+				self:RunSkill(capturedSkill)
+			end,
+			false,
+			keyCode,
+			SLOT_GAMEPAD_KEYS[i]
+		)
+	end
+end
+
+function ActionObject.Clean(self)
+	for i = 1, 4 do
+		ContextActionService:UnbindAction("SkillSlot_" .. i)
+	end
+	self.__Trove:Clean()
+end
+
+function ActionObject.Process(self: ActionType, KeyState)
+	if self.Controller.Attributes.Using then return end
+
+	local Action
+	if KeyState.Type == "Awakening" then
+		local equippedId = self.Controller.Character:GetAttribute("EquippedAwakening")
+		Action = equippedId and self.ActionMap.Awakening[equippedId]
+
+		Action = Action or self.ActionMap.Combat.Awaken
+	else
+		Action = self.ActionMap[KeyState.Type]
+			and self.ActionMap[KeyState.Type][KeyState.Action]
+	end
+	if not Action then
+		print("Action not found:", KeyState.Type, KeyState.Action)
+		return
+	end
+
+	self:RunSkill(Action)
+end
+
+function ActionObject.RunSkill(self: ActionType, Action)
+	local char = self.Controller.Character
+	if UIManager.AnyOpen() then return end
+	if not char:GetAttribute("WeaponEquipped") then return end
+
+
+	local isToggle = Action.Name == "Sprint" or Action.Name == "Slide"
+	local isCancel = Action.Name == "Feint"
+	if not isToggle and not isCancel and not stateCheck(char) then return end
+
+	local cooldown = Action.Cooldown or 0
+	if self.Controller.Attributes.Using and not isToggle then return end
+
+	if self._skillDebounce then return end
+	self._skillDebounce = true
+	task.delay(0.1, function()
+		self._skillDebounce = false
+	end)
+
+	task.spawn(Action.Execute, self.Controller)
+end
+
+function ActionObject.Clean(self: ActionType)
+	self.__Trove:Clean()
+end
